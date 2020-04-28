@@ -8,8 +8,7 @@
 
 //! Thread-local random number generator
 
-use core::cell::UnsafeCell;
-use core::ptr::NonNull;
+use core::{cell::{RefCell,Ref}, ops::Deref};
 
 use super::std::Core;
 use crate::rngs::adapter::ReseedingRng;
@@ -36,6 +35,28 @@ use crate::{CryptoRng, Error, RngCore, SeedableRng};
 // of 32 kB and less. We choose 64 kB to avoid significant overhead.
 const THREAD_RNG_RESEED_THRESHOLD: u64 = 1024 * 64;
 
+type Inner = ReseedingRng<Core, OsRng>;
+
+struct RngKey( RefCell<Inner> );
+
+impl RngKey {
+    fn static_borrow(&'static self) -> Ref<'static, Inner> { self.0.borrow() }
+}
+
+impl Drop for RngKey {
+    fn drop(&mut self) {
+        self.0.try_borrow_mut().expect("thread_local RNG dropped with outstanding references");
+    }
+}
+
+thread_local!(
+    static THREAD_RNG_KEY: RngKey = RngKey(RefCell::new({
+        let r = Core::from_rng(OsRng).unwrap_or_else(|err|
+                panic!("could not initialize thread_rng: {}", err));
+        ReseedingRng::new(r,THREAD_RNG_RESEED_THRESHOLD,OsRng)
+    }))
+);
+
 /// The type returned by [`thread_rng`], essentially just a reference to the
 /// PRNG in thread-local memory.
 ///
@@ -53,22 +74,13 @@ const THREAD_RNG_RESEED_THRESHOLD: u64 = 1024 * 64;
 ///
 /// [`ReseedingRng`]: crate::rngs::adapter::ReseedingRng
 /// [`StdRng`]: crate::rngs::StdRng
-#[derive(Copy, Clone, Debug)]
-pub struct ThreadRng {
-    // inner raw pointer implies type is neither Send nor Sync
-    rng: NonNull<ReseedingRng<Core, OsRng>>,
-}
+#[derive(Debug)]
+pub struct ThreadRng( Ref<'static, Inner> );
+// Ref implies type is neither Send nor Sync not ...
 
-thread_local!(
-    static THREAD_RNG_KEY: UnsafeCell<ReseedingRng<Core, OsRng>> = {
-        let r = Core::from_rng(OsRng).unwrap_or_else(|err|
-                panic!("could not initialize thread_rng: {}", err));
-        let rng = ReseedingRng::new(r,
-                                    THREAD_RNG_RESEED_THRESHOLD,
-                                    OsRng);
-        UnsafeCell::new(rng)
-    }
-);
+impl Clone for ThreadRng {
+    fn clone(&self) -> ThreadRng { thread_rng() }
+}
 
 /// Retrieve the lazily-initialized thread-local random number generator,
 /// seeded by the system. Intended to be used in method chaining style,
@@ -78,9 +90,10 @@ thread_local!(
 ///
 /// For more information see [`ThreadRng`].
 pub fn thread_rng() -> ThreadRng {
-    let raw = THREAD_RNG_KEY.with(|t| t.get());
-    let nn = NonNull::new(raw).unwrap();
-    ThreadRng { rng: nn }
+    ThreadRng(THREAD_RNG_KEY.with( |r: &RngKey| {
+        let r: &'static RngKey = unsafe { (r as *const RngKey).as_ref() }.unwrap();
+        r.static_borrow() 
+    }))
 }
 
 impl Default for ThreadRng {
@@ -89,23 +102,31 @@ impl Default for ThreadRng {
     }
 }
 
+impl ThreadRng {
+    #[inline(always)]
+    fn rng(&mut self) -> &mut Inner {
+        let rng: &Inner = self.0.deref();
+        let rng: *mut Inner = unsafe { ::core::mem::transmute(rng as *const Inner) };
+        unsafe { rng.as_mut() }.unwrap()
+    }
+}
 impl RngCore for ThreadRng {
     #[inline(always)]
     fn next_u32(&mut self) -> u32 {
-        unsafe { self.rng.as_mut().next_u32() }
+        self.rng().next_u32()
     }
 
     #[inline(always)]
     fn next_u64(&mut self) -> u64 {
-        unsafe { self.rng.as_mut().next_u64() }
+        self.rng().next_u64()
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        unsafe { self.rng.as_mut().fill_bytes(dest) }
+        self.rng().fill_bytes(dest)
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-        unsafe { self.rng.as_mut().try_fill_bytes(dest) }
+        self.rng().try_fill_bytes(dest)
     }
 }
 
